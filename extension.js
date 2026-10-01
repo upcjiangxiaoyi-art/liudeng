@@ -31,7 +31,7 @@ const claim = (id) => api(`/jobs/${id}/claim`, { method: 'POST', body: '{}' }).c
 
 // ---------- 生成开始时报到 ----------
 
-async function onGenerationStarted(type, _opts, dryRun) {
+function onGenerationStarted(type, _opts, dryRun) {
     if (dryRun) return;
     const c = ctx();
     const q = new URLSearchParams({ chatId: c.getCurrentChatId?.() ?? '', type: type || 'normal' });
@@ -40,9 +40,18 @@ async function onGenerationStarted(type, _opts, dryRun) {
         q.set('baseLen', String(m.length));
         q.set('baseTail', m.slice(-60));
     }
-    try {
-        await fetch(`${API}/tag?${q}`, { method: 'POST', headers: c.getRequestHeaders(), body: '{}', signal: timeout(1500) });
-    } catch { /* 插件没开也不影响正常生成 */ }
+    // 不等它回来：酒馆要等所有监听器跑完才发请求，等的话每次生成（包括别的插件的）都要多一个手机到 VPS 的来回。
+    // 报到偶尔比请求晚到也没事，服务端会补挂上。
+    fetch(`${API}/tag?${q}`, { method: 'POST', headers: c.getRequestHeaders(), body: '{}', signal: timeout(5000) })
+        .catch(() => { /* 插件没开也不影响正常生成 */ });
+}
+
+// 点了停止就是真不要了，让服务端也别再收，不然中转站照样按整条计费
+function onGenerationStopped() {
+    const c = ctx();
+    const q = new URLSearchParams({ chatId: c.getCurrentChatId?.() ?? '' });
+    fetch(`${API}/stop?${q}`, { method: 'POST', headers: c.getRequestHeaders(), body: '{}', signal: timeout(5000) })
+        .catch(() => {});
 }
 
 // ---------- 检查与提示 ----------
@@ -319,6 +328,7 @@ jQuery(() => {
     const { eventSource, event_types } = ctx();
     addMenu();
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+    eventSource.on(event_types.GENERATION_STOPPED, onGenerationStopped);
     // iOS 杀掉页面后重开、或者切换聊天时，都检查一次
     eventSource.on(event_types.CHAT_CHANGED, () => setTimeout(check, 800));
     document.addEventListener('visibilitychange', onVisible);

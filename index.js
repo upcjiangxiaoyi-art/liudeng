@@ -75,8 +75,11 @@ function newJob(url, host) {
         model: (url.match(/models\/([^:?/]+)/) || [])[1] || '',
         startedAt: Date.now(),
         finishedAt: 0,
-        status: 'running',     // running | done | failed
+        status: 'running',     // running | done | failed | stopped
         downstreamGone: false, // 酒馆那头是否中途断开
+        goneAt: 0,
+        stopped: false,        // 用户点了停止，上游已掐掉
+        ctrl: new AbortController(),
         claimed: false,        // 前端是否已经捞回
         tag: takeTag(),
         httpStatus: 0,
@@ -184,11 +187,13 @@ function settle(job, raw, isSSE) {
     job.reasoning = reasoning;
     job.finish = job.finish || finish;
     job.finishedAt = Date.now();
-    job.status = job.httpStatus >= 200 && job.httpStatus < 300 && !job.error ? 'done' : 'failed';
+    job.status = job.stopped ? 'stopped'
+        : job.httpStatus >= 200 && job.httpStatus < 300 && !job.error ? 'done' : 'failed';
     if (job.status === 'failed' && !job.error) job.error = raw.slice(0, 300);
     const secs = Math.round((job.finishedAt - job.startedAt) / 1000);
-    log(`#${job.id} ${job.host} ${job.status}，${text.length} 字，${secs}s${job.downstreamGone ? '（酒馆中途断开，已留存）' : ''}`);
-    if (job.downstreamGone && job.tag?.type !== 'quiet') notify(job);
+    const kept = job.downstreamGone && !job.stopped;
+    log(`#${job.id} ${job.host} ${job.status}，${text.length} 字，${secs}s${kept ? '（酒馆中途断开，已留存）' : ''}`);
+    if (kept && job.tag?.type !== 'quiet') notify(job);
 }
 
 async function handle(req, res) {
@@ -204,9 +209,14 @@ async function handle(req, res) {
         gone = true;
         if (job && job.status === 'running') {
             job.downstreamGone = true;
+            job.goneAt = Date.now();
             log(`#${job.id} 酒馆那头断了，继续收`);
         }
     });
+
+    // 超时和「用户点了停止」都走这一个开关
+    const ctrl = job ? job.ctrl : new AbortController();
+    const timer = setTimeout(() => ctrl.abort(new Error(`超过 ${Math.round(CONFIG.timeoutMs / 1000)}s 还没收完`)), CONFIG.timeoutMs);
 
     let upstream;
     try {
@@ -214,9 +224,10 @@ async function handle(req, res) {
             method: req.method,
             headers: pickReqHeaders(req.headers),
             body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
-            signal: AbortSignal.timeout(CONFIG.timeoutMs),
+            signal: ctrl.signal,
         });
     } catch (e) {
+        clearTimeout(timer);
         if (job) {
             job.error = '连不上上游：' + (e?.message || e);
             settle(job, '', false);
@@ -251,6 +262,7 @@ async function handle(req, res) {
         if (job) job.error = '读取上游中断：' + (e?.message || e);
     }
     if (!gone && !res.destroyed) res.end();
+    clearTimeout(timer);
     if (job) settle(job, raw, isSSE);
 }
 
@@ -296,6 +308,23 @@ export async function init(router) {
         if (!j) return res.status(404).json({ error: 'not found' });
         j.claimed = true;
         res.json({ ok: true });
+    });
+
+    // 用户点了停止：掐掉这个聊天里刚断开（或还没断开）的那条，免得中转站把整条收完再计费。
+    // 断开超过几秒的是切后台留下来的，不动；别的插件的 quiet 生成也不动。
+    router.post('/stop', (req, res) => {
+        const chatId = String(req.query?.chatId || '');
+        let n = 0;
+        for (const j of jobs) {
+            if (j.status !== 'running' || !j.tag || j.tag.type === 'quiet' || j.tag.chatId !== chatId) continue;
+            if (j.downstreamGone && Date.now() - j.goneAt > 5000) continue;
+            j.stopped = true;
+            j.claimed = true;
+            j.ctrl.abort(new Error('用户停止'));
+            n++;
+        }
+        if (n) log(`点了停止，掐掉 ${n} 条上游`);
+        res.json({ ok: true, stopped: n });
     });
 
     // 前端在 GENERATION_STARTED 时报到，参数走 query，免得依赖 body 解析
