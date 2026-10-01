@@ -38,7 +38,10 @@ function loadConfig() {
 
 const CONFIG = loadConfig();
 
-const GEN_PATH = /generateContent|chat\/completions/i;
+// Gemini 原生 / OpenAI 兼容 / Claude 原生（中转站常见的三种）
+const GEN_PATH = /generateContent|chat\/completions|\/messages(?:\?|$)/i;
+// 中转站写法：http://127.0.0.1:5010/https://中转站地址/v1 ，前缀后面就是真正的上游
+const INLINE = /^\/(https?):\/\/?([^/?#]+)(.*)$/i;
 const DROP_REQ = new Set(['host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding', 'keep-alive']);
 const DROP_RES = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'keep-alive']);
 
@@ -57,9 +60,18 @@ function takeTag() {
     return null;
 }
 
-function newJob(url) {
+// 地址里带了上游就走那个，没带就走 config 里的 upstream
+function route(url) {
+    const m = url.match(INLINE);
+    if (!m) return { target: CONFIG.upstream + url, host: CONFIG.upstream.replace(/^\w+:\/\//, '').split('/')[0], path: url };
+    const path = m[3] || '/';
+    return { target: `${m[1].toLowerCase()}://${m[2]}${path}`, host: m[2], path };
+}
+
+function newJob(url, host) {
     const job = {
         id: crypto.randomBytes(4).toString('hex'),
+        host,
         model: (url.match(/models\/([^:?/]+)/) || [])[1] || '',
         startedAt: Date.now(),
         finishedAt: 0,
@@ -87,7 +99,7 @@ function pickReqHeaders(src) {
     return out;
 }
 
-// 从原始响应里拆出正文、思考、结束原因。兼容 Gemini 原生和 OpenAI 兼容格式，流式非流式都行。
+// 从原始响应里拆出正文、思考、结束原因。兼容 Gemini 原生、OpenAI 兼容、Claude 原生格式，流式非流式都行。
 function extract(raw, isSSE) {
     const objs = [];
     const t = raw.trim();
@@ -128,6 +140,17 @@ function extract(raw, isSSE) {
             if (typeof r === 'string') reasoning += r;
             if (ch.finish_reason) finish = ch.finish_reason;
         }
+
+        // Claude：流式是一块块 content_block_delta，非流式是 content 数组
+        const blocks = o?.type === 'message' && Array.isArray(o.content) ? o.content
+            : o?.type === 'content_block_start' ? [o.content_block]
+            : o?.type === 'content_block_delta' ? [o.delta] : [];
+        for (const b of blocks) {
+            if (typeof b?.text === 'string') text += b.text;
+            if (typeof b?.thinking === 'string') reasoning += b.thinking;
+        }
+        const stop = o?.stop_reason ?? (o?.type === 'message_delta' ? o.delta?.stop_reason : null);
+        if (stop) finish = /^(end_turn|stop_sequence)$/.test(stop) ? 'stop' : stop;
     }
     return { text, reasoning, finish };
 }
@@ -164,7 +187,7 @@ function settle(job, raw, isSSE) {
     job.status = job.httpStatus >= 200 && job.httpStatus < 300 && !job.error ? 'done' : 'failed';
     if (job.status === 'failed' && !job.error) job.error = raw.slice(0, 300);
     const secs = Math.round((job.finishedAt - job.startedAt) / 1000);
-    log(`#${job.id} ${job.status}，${text.length} 字，${secs}s${job.downstreamGone ? '（酒馆中途断开，已留存）' : ''}`);
+    log(`#${job.id} ${job.host} ${job.status}，${text.length} 字，${secs}s${job.downstreamGone ? '（酒馆中途断开，已留存）' : ''}`);
     if (job.downstreamGone && job.tag?.type !== 'quiet') notify(job);
 }
 
@@ -173,7 +196,8 @@ async function handle(req, res) {
     for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks);
 
-    const job = req.method === 'POST' && GEN_PATH.test(req.url) ? newJob(req.url) : null;
+    const { target, host, path } = route(req.url);
+    const job = req.method === 'POST' && GEN_PATH.test(path) ? newJob(path, host) : null;
     let gone = false;
     res.on('close', () => {
         if (res.writableEnded) return;
@@ -186,7 +210,7 @@ async function handle(req, res) {
 
     let upstream;
     try {
-        upstream = await fetch(CONFIG.upstream + req.url, {
+        upstream = await fetch(target, {
             method: req.method,
             headers: pickReqHeaders(req.headers),
             body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
