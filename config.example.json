@@ -1,0 +1,11 @@
+{
+  "port": 5010,
+  "upstream": "https://generativelanguage.googleapis.com",
+  "keep": 10,
+  "timeoutMs": 900000,
+  "notify": {
+    "mode": "off",
+    "barkUrl": "https://api.day.app/你的BarkKey",
+    "webhookUrl": ""
+  }
+}

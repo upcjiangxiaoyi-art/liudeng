@@ -1,0 +1,9 @@
+{
+    "display_name": "留灯",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "extension.js",
+    "author": "江 & Claude",
+    "version": "0.1.0"
+}
