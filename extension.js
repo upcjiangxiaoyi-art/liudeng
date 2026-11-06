@@ -244,7 +244,9 @@ function isPartial(mes, regexed, raw) {
 
 // ---------- iOS 保活 ----------
 
-// 10 分钟、8kHz、16 位单声道，振幅 ±2（约 -84dBFS，听不见），在内存里生成，不用另外托管文件
+// 10 分钟、8kHz、16 位单声道，在内存里生成，不用另外托管文件。
+// 全是 0，只在每秒留一个最小的采样点（±1），让它不算纯静音文件。
+// 以前是满屏 ±2 的随机噪声，戴耳机音量大时能听见沙沙声。
 function quietWavUrl(seconds = 600, rate = 8000) {
     const n = seconds * rate;
     const buf = new ArrayBuffer(44 + n * 2);
@@ -254,7 +256,7 @@ function quietWavUrl(seconds = 600, rate = 8000) {
     s(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
     v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
     s(36, 'data'); v.setUint32(40, n * 2, true);
-    for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, ((Math.random() * 5) | 0) - 2, true);
+    for (let i = 0; i < n; i += rate) v.setInt16(44 + i * 2, (i / rate) % 2 ? -1 : 1, true);
     return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
 
